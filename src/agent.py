@@ -2,16 +2,18 @@
 Hacker News Research Agent using Resonate
 
 Monitors Hacker News for content matching your keywords. Uses AI to evaluate
-relevance, tracks what's been processed so scans are never duplicated, and
-runs continuously across restarts without losing progress.
+relevance and runs continuously — surviving restarts without losing progress.
 
-Every operation is a durable checkpoint — if the process crashes mid-scan,
-it resumes exactly where it left off.
+Resonate checkpoints every step of each scan. If the process crashes mid-scan,
+it resumes from the last successful checkpoint. The seen_ids set is rebuilt
+correctly on replay: Resonate re-runs the generator but returns cached results
+for completed steps, so the set accumulates in the same order as before.
+
+No external database required.
 """
 
 import json
 import os
-import sqlite3
 import time
 import urllib.parse
 import urllib.request
@@ -23,66 +25,7 @@ from resonate import Context, Resonate
 
 load_dotenv()
 
-# ============================================================================
-# Resonate
-# ============================================================================
-
 resonate = Resonate()
-
-# ============================================================================
-# Database (SQLite — no external dependencies)
-# ============================================================================
-
-
-def init_database(_, db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS processed_stories (
-                story_id   TEXT PRIMARY KEY,
-                title      TEXT NOT NULL,
-                url        TEXT,
-                processed_at TEXT DEFAULT (datetime('now')),
-                relevance_score INTEGER,
-                was_interesting INTEGER
-            )
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def has_processed_story(_, db_path: str, story_id: str) -> bool:
-    conn = sqlite3.connect(db_path)
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM processed_stories WHERE story_id = ?", (story_id,)
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
-
-
-def mark_story_processed(
-    _,
-    db_path: str,
-    story_id: str,
-    title: str,
-    url: str,
-    relevance_score: int,
-    is_interesting: bool,
-) -> None:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            """INSERT OR IGNORE INTO processed_stories
-               (story_id, title, url, relevance_score, was_interesting)
-               VALUES (?, ?, ?, ?, ?)""",
-            (story_id, title, url, relevance_score, int(is_interesting)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # ============================================================================
@@ -97,9 +40,7 @@ def search_hackernews(_, keyword: str, max_results: int = 30) -> list[dict]:
         "tags": "story",
     })
     url = f"https://hn.algolia.com/api/v1/search?{params}"
-
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(url, timeout=30) as response:
         data = json.loads(response.read())
         return data.get("hits", [])
 
@@ -226,61 +167,47 @@ def notify_findings(
 @resonate.register
 def scan_keyword(
     ctx: Context,
-    db_path: str,
     openai_api_key: str,
     keyword: str,
+    seen_ids: set[str],
     relevance_threshold: int,
     slack_webhook: Optional[str],
-) -> None:
+) -> list[str]:
     """
-    Single durable scan of Hacker News for one keyword.
+    One durable scan for a single keyword.
 
-    Each sub-step (fetch, dedup check, AI analysis, DB write, notify) is
-    checkpointed. A crash mid-scan resumes from the last successful step
-    rather than re-running everything from scratch.
+    Fetches stories, skips any already in seen_ids, analyzes the rest with AI,
+    and returns the IDs of newly processed stories so the caller can track them.
+
+    Each step is a checkpoint — a crash mid-scan resumes from where it left off.
     """
     print(f"🔍 Scanning HN for: '{keyword}'")
 
     stories = yield ctx.run(search_hackernews, keyword)
-    print(f"📚 Found {len(stories)} stories")
+    new_stories = [s for s in stories if s["objectID"] not in seen_ids]
 
-    new_stories = []
-    for story in stories:
-        already_seen = yield ctx.run(has_processed_story, db_path, story["objectID"])
-        if not already_seen:
-            new_stories.append(story)
-
-    print(f"📊 {len(new_stories)} new stories to analyze")
+    print(f"📚 {len(stories)} stories found, {len(new_stories)} new")
 
     interesting = []
+    newly_seen = []
+
     for story in new_stories:
         analysis = yield ctx.run(analyze_story, openai_api_key, story, keyword)
-
-        yield ctx.run(
-            mark_story_processed,
-            db_path,
-            analysis["story_id"],
-            analysis["title"],
-            analysis["url"],
-            analysis["relevance_score"],
-            analysis["is_interesting"],
-        )
+        newly_seen.append(story["objectID"])
 
         if analysis["is_interesting"] and analysis["relevance_score"] >= relevance_threshold:
             interesting.append(analysis)
 
     yield ctx.run(notify_findings, interesting, keyword, slack_webhook)
 
-    print(f"📊 Scan Results for '{keyword}':")
-    print(f"   Stories found:      {len(stories)}")
-    print(f"   New stories:        {len(new_stories)}")
-    print(f"   Interesting:        {len(interesting)}\n")
+    print(f"   Analyzed: {len(new_stories)}  Interesting: {len(interesting)}\n")
+
+    return newly_seen
 
 
 @resonate.register
 def monitor_hackernews(
     ctx: Context,
-    db_path: str,
     openai_api_key: str,
     keywords: list[str],
     relevance_threshold: int,
@@ -288,32 +215,36 @@ def monitor_hackernews(
     slack_webhook: Optional[str],
 ) -> None:
     """
-    Continuous monitoring workflow. Scans all keywords on a configurable
-    interval, sleeping durably between rounds.
+    Continuous monitoring loop.
 
-    Because sleep is durable, a restart during a sleep period resumes the
-    sleep rather than triggering an immediate redundant scan.
+    Owns the seen_ids set. On crash-recovery, Resonate replays the generator
+    and returns cached results for completed steps, so seen_ids is rebuilt
+    correctly — no external state store needed.
+
+    Sleeps durably between rounds: a restart during a sleep resumes the sleep
+    rather than triggering an immediate redundant scan.
     """
-    yield ctx.run(init_database, db_path)
-
     print("🤖 Hacker News Monitor Started")
-    print(f"📡 Monitoring keywords: {', '.join(keywords)}")
+    print(f"📡 Keywords: {', '.join(keywords)}")
     print(f"⏰ Scan interval: {scan_interval_secs / 60:.0f} minutes")
     print(f"🎯 Relevance threshold: {relevance_threshold}/10\n")
+
+    seen_ids: set[str] = set()
 
     while True:
         scan_start = time.monotonic()
 
         for keyword in keywords:
             try:
-                yield ctx.run(
+                newly_seen = yield ctx.run(
                     scan_keyword,
-                    db_path,
                     openai_api_key,
                     keyword,
+                    seen_ids,
                     relevance_threshold,
                     slack_webhook,
                 )
+                seen_ids.update(newly_seen)
             except Exception as e:
                 print(f"❌ Error scanning '{keyword}': {e}")
 
@@ -334,7 +265,6 @@ def main() -> None:
         raise SystemExit("❌ OPENAI_API_KEY environment variable is required")
 
     keywords = [k.strip() for k in os.getenv("HN_KEYWORDS", "AI").split(",")]
-    db_path = os.getenv("DB_PATH", "hackernews_agent.db")
     slack_webhook = os.getenv("SLACK_WEBHOOK")
     scan_interval_secs = float(os.getenv("SCAN_INTERVAL_SECS", "3600"))
     relevance_threshold = int(os.getenv("RELEVANCE_THRESHOLD", "7"))
@@ -349,7 +279,6 @@ def main() -> None:
 
     handle = monitor_hackernews.begin_run(
         "hackernews-monitor",
-        db_path,
         openai_api_key,
         keywords,
         relevance_threshold,

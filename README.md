@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/banner.png" alt="HackerNews Research Agent — Resonate example" />
+</p>
+
 # Hacker News Research Agent (Python + Resonate)
 
 A durable Hacker News monitoring agent built with [Resonate](https://resonatehq.io) and Python. Continuously scans for content matching your keywords and uses AI to evaluate relevance — surviving restarts without losing progress or re-processing stories.

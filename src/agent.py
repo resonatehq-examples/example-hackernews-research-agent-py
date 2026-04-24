@@ -1,23 +1,20 @@
 """
 Hacker News Research Agent using Resonate
 
-Monitors Hacker News for content matching your keywords. Uses AI to evaluate
+Monitors Hacker News for content matching your keywords. Uses an LLM to rank
 relevance and runs continuously — surviving restarts without losing progress.
 
-Resonate checkpoints every step of each scan. If the process crashes mid-scan,
-it resumes from the last successful checkpoint. The seen_ids set is rebuilt
-correctly on replay: Resonate re-runs the generator but returns cached results
-for completed steps, so the set accumulates in the same order as before.
-
-No external database required.
+Every step is a durable checkpoint. On crash, Resonate re-runs the generator
+but returns cached results for completed steps, so accumulated state rebuilds
+in the same order. The promise store IS the state store — no external DB.
 """
 
 import json
 import os
-import time
 import urllib.parse
 import urllib.request
-from typing import Optional
+from threading import Event
+from typing import Optional, TypedDict
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -28,12 +25,19 @@ load_dotenv()
 resonate = Resonate()
 
 
+class AgentConfig(TypedDict):
+    keywords: list[str]
+    slack_webhook: Optional[str]
+    scan_interval_secs: float
+    relevance_threshold: int
+
+
 # ============================================================================
 # Hacker News API
 # ============================================================================
 
 
-def search_hackernews(_, keyword: str, max_results: int = 30) -> list[dict]:
+def search_hackernews(_: Context, keyword: str, max_results: int = 30) -> list[dict]:
     params = urllib.parse.urlencode({
         "query": keyword,
         "hitsPerPage": max_results,
@@ -46,12 +50,12 @@ def search_hackernews(_, keyword: str, max_results: int = 30) -> list[dict]:
 
 
 # ============================================================================
-# AI Analysis
+# LLM Analysis
 # ============================================================================
 
 
-def analyze_story(_, openai_api_key: str, story: dict, keyword: str) -> dict:
-    client = OpenAI(api_key=openai_api_key)
+def analyze_story(ctx: Context, story: dict, keyword: str) -> dict:
+    client: OpenAI = ctx.get_dependency("openai")
 
     prompt = f"""Analyze this Hacker News story for relevance to "{keyword}":
 
@@ -60,7 +64,7 @@ URL: {story.get("url") or "No URL"}
 Points: {story.get("points", 0)}
 Comments: {story.get("num_comments", 0)}
 
-Rate the relevance (1-10) and determine if it's interesting enough to notify someone.
+Rate the relevance (1-10) and decide if it is interesting enough to notify someone.
 A story is interesting if it:
 - Provides actionable insights or news
 - Discusses significant developments or trends
@@ -109,9 +113,10 @@ Respond with JSON:
 # ============================================================================
 
 
-def notify_findings(
-    _, findings: list[dict], keyword: str, slack_webhook: Optional[str] = None
-) -> None:
+def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
+    config: AgentConfig = ctx.get_dependency("config")
+    slack_webhook = config.get("slack_webhook")
+
     if not findings:
         print(f"📭 No interesting findings for '{keyword}'")
         return
@@ -167,63 +172,68 @@ def notify_findings(
 @resonate.register
 def scan_keyword(
     ctx: Context,
-    openai_api_key: str,
     keyword: str,
-    seen_ids: set[str],
-    relevance_threshold: int,
-    slack_webhook: Optional[str],
-) -> list[str]:
+    seen_ids: Optional[list[str]] = None,
+):
     """
     One durable scan for a single keyword.
 
-    Fetches stories, skips any already in seen_ids, analyzes the rest with AI,
-    and returns the IDs of newly processed stories so the caller can track them.
+    Fetches stories, analyzes any not already in `seen_ids` with the LLM, and
+    returns the full analysis set. `seen_ids` is a plain list so this function
+    is CLI/RPC-invokable — callers without prior state pass `[]` (or omit the
+    arg via the CLI).
 
-    Each step is a checkpoint — a crash mid-scan resumes from where it left off.
+    Each internal `yield ctx.run()` is a checkpoint: a crash mid-scan resumes
+    from the last completed step.
     """
-    print(f"🔍 Scanning HN for: '{keyword}'")
+    config: AgentConfig = ctx.get_dependency("config")
+    relevance_threshold = config["relevance_threshold"]
 
     stories = yield ctx.run(search_hackernews, keyword)
-    new_stories = [s for s in stories if s["objectID"] not in seen_ids]
+    seen = set(seen_ids or [])
+    new_stories = [s for s in stories if s["objectID"] not in seen]
 
+    print(f"🔍 Scanning HN for: '{keyword}'")
     print(f"📚 {len(stories)} stories found, {len(new_stories)} new")
 
-    interesting = []
-    newly_seen = []
-
+    newly_analyzed = []
     for story in new_stories:
-        analysis = yield ctx.run(analyze_story, openai_api_key, story, keyword)
-        newly_seen.append(story["objectID"])
+        analysis = yield ctx.run(analyze_story, story, keyword)
+        newly_analyzed.append(analysis)
 
-        if analysis["is_interesting"] and analysis["relevance_score"] >= relevance_threshold:
-            interesting.append(analysis)
+    interesting = [
+        a for a in newly_analyzed
+        if a["is_interesting"] and a["relevance_score"] >= relevance_threshold
+    ]
 
-    yield ctx.run(notify_findings, interesting, keyword, slack_webhook)
+    yield ctx.run(notify_findings, interesting, keyword)
 
     print(f"   Analyzed: {len(new_stories)}  Interesting: {len(interesting)}\n")
 
-    return newly_seen
+    return {
+        "keyword": keyword,
+        "stories_found": len(stories),
+        "newly_analyzed": newly_analyzed,
+    }
 
 
 @resonate.register
-def monitor_hackernews(
-    ctx: Context,
-    openai_api_key: str,
-    keywords: list[str],
-    relevance_threshold: int,
-    scan_interval_secs: float,
-    slack_webhook: Optional[str],
-) -> None:
+def monitor_hackernews(ctx: Context):
     """
     Continuous monitoring loop.
 
-    Owns the seen_ids set. On crash-recovery, Resonate replays the generator
-    and returns cached results for completed steps, so seen_ids is rebuilt
-    correctly — no external state store needed.
+    Owns the `seen_ids` set. On crash-recovery Resonate replays this generator
+    and returns cached results for completed `scan_keyword` calls, so `seen_ids`
+    rebuilds deterministically — the promise store IS the state store.
 
-    Sleeps durably between rounds: a restart during a sleep resumes the sleep
-    rather than triggering an immediate redundant scan.
+    `yield ctx.sleep(...)` between rounds is a durable timer: a restart during
+    sleep resumes the sleep rather than triggering an immediate redundant scan.
     """
+    config: AgentConfig = ctx.get_dependency("config")
+    keywords = config["keywords"]
+    scan_interval_secs = config["scan_interval_secs"]
+    relevance_threshold = config["relevance_threshold"]
+
     print("🤖 Hacker News Monitor Started")
     print(f"📡 Keywords: {', '.join(keywords)}")
     print(f"⏰ Scan interval: {scan_interval_secs / 60:.0f} minutes")
@@ -232,24 +242,13 @@ def monitor_hackernews(
     seen_ids: set[str] = set()
 
     while True:
-        scan_start = time.monotonic()
-
         for keyword in keywords:
             try:
-                newly_seen = yield ctx.run(
-                    scan_keyword,
-                    openai_api_key,
-                    keyword,
-                    seen_ids,
-                    relevance_threshold,
-                    slack_webhook,
-                )
-                seen_ids.update(newly_seen)
+                result = yield ctx.run(scan_keyword, keyword, list(seen_ids))
+                for a in result["newly_analyzed"]:
+                    seen_ids.add(a["story_id"])
             except Exception as e:
                 print(f"❌ Error scanning '{keyword}': {e}")
-
-        elapsed = time.monotonic() - scan_start
-        print(f"✅ Round complete ({elapsed:.1f}s)\n")
 
         yield ctx.sleep(scan_interval_secs)
 
@@ -264,30 +263,28 @@ def main() -> None:
     if not openai_api_key:
         raise SystemExit("❌ OPENAI_API_KEY environment variable is required")
 
-    keywords = [k.strip() for k in os.getenv("HN_KEYWORDS", "AI").split(",")]
-    slack_webhook = os.getenv("SLACK_WEBHOOK")
-    scan_interval_secs = float(os.getenv("SCAN_INTERVAL_SECS", "3600"))
-    relevance_threshold = int(os.getenv("RELEVANCE_THRESHOLD", "7"))
+    config: AgentConfig = {
+        "keywords": [k.strip() for k in os.getenv("HN_KEYWORDS", "AI").split(",")],
+        "slack_webhook": os.getenv("SLACK_WEBHOOK"),
+        "scan_interval_secs": float(os.getenv("SCAN_INTERVAL_SECS", "3600")),
+        "relevance_threshold": int(os.getenv("RELEVANCE_THRESHOLD", "7")),
+    }
+
+    resonate.set_dependency("openai", OpenAI(api_key=openai_api_key))
+    resonate.set_dependency("config", config)
 
     print("\n🤖 Hacker News Agent Worker Started")
-    print(f"⚙️  Keywords: {', '.join(keywords)}")
-    print(f"⏰ Scan interval: {scan_interval_secs / 60:.0f} minutes\n")
-    print("📝 To run a one-time scan:")
-    print(f'   resonate invoke scan-1 --func scan_keyword --arg "{keywords[0]}"')
-    print("\n📝 To start continuous monitoring:")
+    print(f"⚙️  Keywords: {', '.join(config['keywords'])}")
+    print(f"⏰ Scan interval: {config['scan_interval_secs'] / 60:.0f} minutes\n")
+    print("📝 Run a one-time scan for a keyword:")
+    print(f"   resonate invoke scan-1 --func scan_keyword --arg \"{config['keywords'][0]}\"")
+    print("\n📝 Start continuous monitoring of configured keywords:")
     print("   resonate invoke monitor-1 --func monitor_hackernews\n")
 
-    handle = monitor_hackernews.begin_run(
-        "hackernews-monitor",
-        openai_api_key,
-        keywords,
-        relevance_threshold,
-        scan_interval_secs,
-        slack_webhook,
-    )
+    resonate.start()
 
     try:
-        handle.result()
+        Event().wait()
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
         resonate.stop()

@@ -21,19 +21,18 @@ Deduplication across scan rounds works through Resonate's replay mechanism: when
 ## Features
 
 - **Durable execution** — survives crashes and restarts, resumes mid-scan
-- **Deduplication** — stories analyzed in previous rounds are skipped, rebuilt through Resonate replay
+- **Deduplication via replay** — stories analyzed in prior rounds are skipped automatically
 - **Durable sleep** — the interval between rounds is a checkpoint; a restart during sleep resumes the sleep rather than triggering an immediate scan
-- **AI-powered analysis** — GPT-4o-mini evaluates relevance and summarizes findings
-- **Multi-keyword support** — monitor multiple topics in a single agent
-- **Slack notifications** — optional webhook for interesting findings
-- **No external database** — Resonate's promise store is the only state you need
+- **LLM-powered analysis** — `gpt-4o-mini` ranks relevance and summarizes findings
+- **Multi-keyword support** — monitor several topics in a single worker
+- **Optional Slack notifications** — webhook fires when interesting stories appear
 
 ## Quick Start
 
 ### 1. Prerequisites
 
 - Python 3.13+
-- Resonate Server running locally (`resonate serve`)
+- [Resonate Server](https://github.com/resonatehq/resonate) running locally
 - OpenAI API key
 
 ### 2. Install
@@ -58,10 +57,10 @@ cp .env.example .env
 - `SCAN_INTERVAL_SECS` — seconds between scan rounds (default: `3600`)
 - `RELEVANCE_THRESHOLD` — minimum AI score (1–10) to count as interesting (default: `7`)
 
-### 4. Start Resonate Server
+### 4. Start the Resonate server
 
 ```bash
-resonate serve
+resonate dev
 ```
 
 ### 5. Run the agent worker
@@ -98,13 +97,41 @@ monitor_hackernews()          ← owns seen_ids, sleeps durably between rounds
 `yield ctx.run()` returns its cached result, so the set rebuilds in the same
 order — correctly excluding already-processed stories.
 
+`scan_keyword` is also safe to invoke on its own: `seen_ids` defaults to `None`
+(treated as empty), so passing just the keyword via the CLI works.
+`monitor_hackernews` calls it with `list(seen_ids)` under the hood.
+
+### Registering dependencies
+
+The OpenAI client and config live in the ephemeral world. They're injected into
+durable functions via Resonate dependencies:
+
+```python
+resonate.set_dependency("openai", openai_client)
+resonate.set_dependency("config", config)
+```
+
+Inside a function, fetch them with `ctx.get_dependency("openai")`. This keeps
+durable functions free of unserializable closures and portable across workers.
+
+### Limits
+
+The `seen_ids` set lives in worker memory and grows unbounded — every story ID
+from every prior round is retained. Replay cost on restart grows with it, since
+Resonate walks the durable log to rebuild state. That's fine for demos and
+modest workloads; long-running production monitors would want to bound the
+window (drop IDs older than N rounds) or snapshot state externally.
+
+Slack delivery is at-least-once — `notify_findings` wraps the webhook POST in a
+single `ctx.run`, so duplicate notifications are possible on retry.
+
 ## Code Structure
 
 ```
 src/
-└── agent.py    # All workflows and step functions (~180 LOC)
+└── agent.py    # All workflows and step functions
 ```
 
 ## License
 
-MIT
+Apache 2.0

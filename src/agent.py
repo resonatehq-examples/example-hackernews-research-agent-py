@@ -4,25 +4,29 @@ Hacker News Research Agent using Resonate
 Monitors Hacker News for content matching your keywords. Uses an LLM to rank
 relevance and runs continuously — surviving restarts without losing progress.
 
-Every step is a durable checkpoint. On crash, Resonate re-runs the generator
-but returns cached results for completed steps, so accumulated state rebuilds
-in the same order. The promise store IS the state store — no external DB.
+Every step is a durable checkpoint. On crash, Resonate resumes from the last
+completed step; results already computed are returned from cache, so
+accumulated state rebuilds in the same order. The promise store IS the state
+store — no external DB.
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 import urllib.parse
 import urllib.request
-from threading import Event
-from typing import Optional, TypedDict
+from typing import TYPE_CHECKING, Optional, TypedDict
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from resonate import Context, Resonate
+from resonate.resonate import Resonate
+
+if TYPE_CHECKING:
+    from resonate.context import Context
 
 load_dotenv()
-
-resonate = Resonate.remote()
 
 
 class AgentConfig(TypedDict):
@@ -32,19 +36,29 @@ class AgentConfig(TypedDict):
     relevance_threshold: int
 
 
+# Thin wrapper so AgentConfig can be stored as a type-keyed dependency.
+class AgentConfigDep:
+    def __init__(self, config: AgentConfig) -> None:
+        self.config = config
+
+
+url = os.environ.get("RESONATE_URL", "http://localhost:8001")
+resonate = Resonate(url=url)
+
+
 # ============================================================================
 # Hacker News API
 # ============================================================================
 
 
-def search_hackernews(_: Context, keyword: str, max_results: int = 30) -> list[dict]:
+async def search_hackernews(_: Context, keyword: str, max_results: int = 30) -> list[dict]:
     params = urllib.parse.urlencode({
         "query": keyword,
         "hitsPerPage": max_results,
         "tags": "story",
     })
-    url = f"https://hn.algolia.com/api/v1/search?{params}"
-    with urllib.request.urlopen(url, timeout=30) as response:
+    hn_url = f"https://hn.algolia.com/api/v1/search?{params}"
+    with urllib.request.urlopen(hn_url, timeout=30) as response:
         data = json.loads(response.read())
         return data.get("hits", [])
 
@@ -54,8 +68,8 @@ def search_hackernews(_: Context, keyword: str, max_results: int = 30) -> list[d
 # ============================================================================
 
 
-def analyze_story(ctx: Context, story: dict, keyword: str) -> dict:
-    client: OpenAI = ctx.get_dependency("openai")
+async def analyze_story(ctx: Context, story: dict, keyword: str) -> dict:
+    client: OpenAI = ctx.get_dependency(OpenAI)
 
     prompt = f"""Analyze this Hacker News story for relevance to "{keyword}":
 
@@ -113,30 +127,31 @@ Respond with JSON:
 # ============================================================================
 
 
-def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
-    config: AgentConfig = ctx.get_dependency("config")
+async def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
+    config_dep: AgentConfigDep = ctx.get_dependency(AgentConfigDep)
+    config = config_dep.config
     slack_webhook = config.get("slack_webhook")
 
     if not findings:
-        print(f"📭 No interesting findings for '{keyword}'")
+        print(f"No interesting findings for '{keyword}'", flush=True)
         return
 
     count = len(findings)
     word = "story" if count == 1 else "stories"
-    print(f"\n🎯 Found {count} interesting {word} about '{keyword}':\n")
+    print(f"\nFound {count} interesting {word} about '{keyword}':\n", flush=True)
 
     for f in findings:
-        print(f"  📰 {f['title']}")
+        print(f"  {f['title']}")
         print(f"     Relevance: {f['relevance_score']}/10")
         print(f"     {f['summary']}")
-        print(f"     🔗 {f['hn_url']}")
+        print(f"     {f['hn_url']}")
         if f["url"]:
-            print(f"     📎 {f['url']}")
+            print(f"     {f['url']}")
         print()
 
     if slack_webhook:
         message = {
-            "text": f"🔍 Found {count} interesting HN {word} about *{keyword}*",
+            "text": f"Found {count} interesting HN {word} about *{keyword}*",
             "blocks": [
                 {
                     "type": "section",
@@ -145,7 +160,7 @@ def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
                         "text": (
                             f"*<{f['hn_url']}|{f['title']}>* ({f['relevance_score']}/10)\n"
                             f"{f['summary']}\n"
-                            + (f"📎 <{f['url']}|Original Article>" if f["url"] else "")
+                            + (f"<{f['url']}|Original Article>" if f["url"] else "")
                         ),
                     },
                 }
@@ -161,7 +176,7 @@ def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
         )
         with urllib.request.urlopen(req) as resp:
             if resp.status == 200:
-                print("✅ Notified via Slack")
+                print("Notified via Slack", flush=True)
 
 
 # ============================================================================
@@ -169,8 +184,7 @@ def notify_findings(ctx: Context, findings: list[dict], keyword: str) -> None:
 # ============================================================================
 
 
-@resonate.register
-def scan_keyword(
+async def scan_keyword(
     ctx: Context,
     keyword: str,
     seen_ids: Optional[list[str]] = None,
@@ -183,22 +197,23 @@ def scan_keyword(
     is CLI/RPC-invokable — callers without prior state pass `[]` (or omit the
     arg via the CLI).
 
-    Each internal `yield ctx.run()` is a checkpoint: a crash mid-scan resumes
+    Each internal `await ctx.run()` is a checkpoint: a crash mid-scan resumes
     from the last completed step.
     """
-    config: AgentConfig = ctx.get_dependency("config")
+    config_dep: AgentConfigDep = ctx.get_dependency(AgentConfigDep)
+    config = config_dep.config
     relevance_threshold = config["relevance_threshold"]
 
-    stories = yield ctx.run(search_hackernews, keyword)
+    stories = await ctx.run(search_hackernews, keyword)
     seen = set(seen_ids or [])
     new_stories = [s for s in stories if s["objectID"] not in seen]
 
-    print(f"🔍 Scanning HN for: '{keyword}'")
-    print(f"📚 {len(stories)} stories found, {len(new_stories)} new")
+    print(f"Scanning HN for: '{keyword}'", flush=True)
+    print(f"{len(stories)} stories found, {len(new_stories)} new", flush=True)
 
     newly_analyzed = []
     for story in new_stories:
-        analysis = yield ctx.run(analyze_story, story, keyword)
+        analysis = await ctx.run(analyze_story, story, keyword)
         newly_analyzed.append(analysis)
 
     interesting = [
@@ -206,9 +221,9 @@ def scan_keyword(
         if a["is_interesting"] and a["relevance_score"] >= relevance_threshold
     ]
 
-    yield ctx.run(notify_findings, interesting, keyword)
+    await ctx.run(notify_findings, interesting, keyword)
 
-    print(f"   Analyzed: {len(new_stories)}  Interesting: {len(interesting)}\n")
+    print(f"   Analyzed: {len(new_stories)}  Interesting: {len(interesting)}\n", flush=True)
 
     return {
         "keyword": keyword,
@@ -217,40 +232,41 @@ def scan_keyword(
     }
 
 
-@resonate.register
-def monitor_hackernews(ctx: Context):
+async def monitor_hackernews(ctx: Context):
     """
     Continuous monitoring loop.
 
-    Owns the `seen_ids` set. On crash-recovery Resonate replays this generator
-    and returns cached results for completed `scan_keyword` calls, so `seen_ids`
-    rebuilds deterministically — the promise store IS the state store.
+    Owns the `seen_ids` set. On crash-recovery Resonate replays the async
+    function and returns cached results for completed `scan_keyword` calls,
+    so `seen_ids` rebuilds deterministically — the promise store IS the state
+    store.
 
-    `yield ctx.sleep(...)` between rounds is a durable timer: a restart during
+    `await ctx.sleep(...)` between rounds is a durable timer: a restart during
     sleep resumes the sleep rather than triggering an immediate redundant scan.
     """
-    config: AgentConfig = ctx.get_dependency("config")
+    config_dep: AgentConfigDep = ctx.get_dependency(AgentConfigDep)
+    config = config_dep.config
     keywords = config["keywords"]
     scan_interval_secs = config["scan_interval_secs"]
     relevance_threshold = config["relevance_threshold"]
 
-    print("🤖 Hacker News Monitor Started")
-    print(f"📡 Keywords: {', '.join(keywords)}")
-    print(f"⏰ Scan interval: {scan_interval_secs / 60:.0f} minutes")
-    print(f"🎯 Relevance threshold: {relevance_threshold}/10\n")
+    print("Hacker News Monitor Started", flush=True)
+    print(f"Keywords: {', '.join(keywords)}", flush=True)
+    print(f"Scan interval: {scan_interval_secs / 60:.0f} minutes", flush=True)
+    print(f"Relevance threshold: {relevance_threshold}/10\n", flush=True)
 
     seen_ids: set[str] = set()
 
     while True:
         for keyword in keywords:
             try:
-                result = yield ctx.run(scan_keyword, keyword, list(seen_ids))
+                result = await ctx.run(scan_keyword, keyword, list(seen_ids))
                 for a in result["newly_analyzed"]:
                     seen_ids.add(a["story_id"])
             except Exception as e:
-                print(f"❌ Error scanning '{keyword}': {e}")
+                print(f"Error scanning '{keyword}': {e}", flush=True)
 
-        yield ctx.sleep(scan_interval_secs)
+        await ctx.sleep(scan_interval_secs)
 
 
 # ============================================================================
@@ -258,11 +274,7 @@ def monitor_hackernews(ctx: Context):
 # ============================================================================
 
 
-def main() -> None:
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise SystemExit("❌ OPENAI_API_KEY environment variable is required")
-
+async def _async_main() -> None:
     config: AgentConfig = {
         "keywords": [k.strip() for k in os.getenv("HN_KEYWORDS", "AI").split(",")],
         "slack_webhook": os.getenv("SLACK_WEBHOOK"),
@@ -270,24 +282,29 @@ def main() -> None:
         "relevance_threshold": int(os.getenv("RELEVANCE_THRESHOLD", "7")),
     }
 
-    resonate.set_dependency("openai", OpenAI(api_key=openai_api_key))
-    resonate.set_dependency("config", config)
+    resonate.with_dependency(OpenAI())
+    resonate.with_dependency(AgentConfigDep(config))
+    resonate.register(scan_keyword)
+    resonate.register(monitor_hackernews)
 
-    print("\n🤖 Hacker News Agent Worker Started")
-    print(f"⚙️  Keywords: {', '.join(config['keywords'])}")
-    print(f"⏰ Scan interval: {config['scan_interval_secs'] / 60:.0f} minutes\n")
-    print("📝 Run a one-time scan for a keyword:")
-    print(f"   resonate invoke scan-1 --func scan_keyword --arg \"{config['keywords'][0]}\"")
-    print("\n📝 Start continuous monitoring of configured keywords:")
-    print("   resonate invoke monitor-1 --func monitor_hackernews\n")
-
-    resonate.start()
+    print("\nHacker News Agent Worker Started", flush=True)
+    print(f"Keywords: {', '.join(config['keywords'])}", flush=True)
+    print(f"Scan interval: {config['scan_interval_secs'] / 60:.0f} minutes\n", flush=True)
+    print("Run a one-time scan for a keyword:", flush=True)
+    print(f"   resonate invoke scan-1 --func scan_keyword --arg \"{config['keywords'][0]}\"", flush=True)
+    print("\nStart continuous monitoring of configured keywords:", flush=True)
+    print("   resonate invoke monitor-1 --func monitor_hackernews\n", flush=True)
 
     try:
-        Event().wait()
-    except KeyboardInterrupt:
-        print("\n👋 Shutting down...")
-        resonate.stop()
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nShutting down...", flush=True)
+    finally:
+        await resonate.stop()
+
+
+def main() -> None:
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":

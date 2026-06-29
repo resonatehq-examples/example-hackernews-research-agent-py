@@ -16,7 +16,7 @@ Scanning an external API, calling an AI model for each result, and notifying on 
 
 Resonate turns the entire scan into a **durable workflow**. Every step is checkpointed — the HN fetch, each AI analysis, the notification. If the process crashes, it resumes from the last successful checkpoint.
 
-Deduplication across scan rounds works through Resonate's replay mechanism: when the workflow recovers, it replays the generator and returns cached results for completed steps. The `seen_ids` set rebuilds itself correctly in order — no external database needed.
+Deduplication across scan rounds works through Resonate's replay mechanism: when the workflow recovers, it replays async functions and returns cached results for completed steps. The `seen_ids` set rebuilds itself correctly in order — no external database needed.
 
 ## Features
 
@@ -94,7 +94,7 @@ monitor_hackernews()          ← owns seen_ids, sleeps durably between rounds
 ```
 
 `seen_ids` is a plain Python set. Resonate makes it durable: on replay, each
-`yield ctx.run()` returns its cached result, so the set rebuilds in the same
+`await ctx.run()` returns its cached result, so the set rebuilds in the same
 order — correctly excluding already-processed stories.
 
 `scan_keyword` is also safe to invoke on its own: `seen_ids` defaults to `None`
@@ -104,15 +104,16 @@ order — correctly excluding already-processed stories.
 ### Registering dependencies
 
 The OpenAI client and config live in the ephemeral world. They're injected into
-durable functions via Resonate dependencies:
+durable functions via Resonate's type-keyed dependency system:
 
 ```python
-resonate.set_dependency("openai", openai_client)
-resonate.set_dependency("config", config)
+resonate.with_dependency(OpenAI())
+resonate.with_dependency(AgentConfigDep(config))
 ```
 
-Inside a function, fetch them with `ctx.get_dependency("openai")`. This keeps
-durable functions free of unserializable closures and portable across workers.
+Inside a function, fetch them by type with `ctx.get_dependency(OpenAI)`. This
+keeps durable functions free of unserializable closures and portable across
+workers.
 
 ### Limits
 

@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
-    "resonate-sdk>=0.6.7",
+    "resonate-sdk>=0.7.0",
 ]
 
 [project.scripts]

@@ -42,10 +42,6 @@ class AgentConfigDep:
         self.config = config
 
 
-url = os.environ.get("RESONATE_URL", "http://localhost:8001")
-resonate = Resonate(url=url)
-
-
 # ============================================================================
 # Hacker News API
 # ============================================================================
@@ -281,6 +277,9 @@ async def _async_main() -> None:
         "scan_interval_secs": float(os.getenv("SCAN_INTERVAL_SECS", "3600")),
         "relevance_threshold": int(os.getenv("RELEVANCE_THRESHOLD", "7")),
     }
+
+    url = os.environ.get("RESONATE_URL", "http://localhost:8001")
+    resonate = Resonate(url=url)
 
     resonate.with_dependency(OpenAI())
     resonate.with_dependency(AgentConfigDep(config))
